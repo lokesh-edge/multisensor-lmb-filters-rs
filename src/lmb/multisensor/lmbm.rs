@@ -166,25 +166,6 @@ impl<A: MultisensorAssociator> MultisensorLmbmFilter<A> {
         );
     }
 
-    /// Update existence probabilities when there are no measurements from any sensor.
-    fn update_existence_no_measurements(&mut self) {
-        let detection_probs: Vec<f64> = self
-            .sensors
-            .sensors
-            .iter()
-            .map(|s| s.detection_probability)
-            .collect();
-        for hyp in &mut self.hypotheses {
-            for track in &mut hyp.tracks {
-                track.existence =
-                    crate::components::update::update_existence_no_detection_multisensor(
-                        track.existence,
-                        &detection_probs,
-                    );
-            }
-        }
-    }
-
     /// Generate multi-sensor association matrices.
     ///
     /// Returns (log_likelihoods, posteriors, dimensions) where:
@@ -308,8 +289,12 @@ impl<A: MultisensorAssociator> MultisensorLmbmFilter<A> {
 
         if num_detections > 0 {
             // Build stacked measurement vector and observation model
-            let z_dim = self.sensors.sensors[0].z_dim(); // Assume uniform z_dim
-            let z_dim_total = z_dim * num_detections;
+            let z_dim_total: usize = detecting
+                .iter()
+                .enumerate()
+                .filter(|(_, &is_detecting)| is_detecting)
+                .map(|(sensor_idx, _)| self.sensors.sensors[sensor_idx].z_dim())
+                .sum();
             let x_dim = self.motion.x_dim();
 
             let mut z = DVector::zeros(z_dim_total);
@@ -321,7 +306,19 @@ impl<A: MultisensorAssociator> MultisensorLmbmFilter<A> {
                 if detecting[s] {
                     let sensor = &self.sensors.sensors[s];
                     let meas_idx = associations[s] - 1; // Convert to 0-indexed
-                    let start = z_dim * counter;
+                    let z_dim = sensor.z_dim();
+                    let start = counter;
+
+                    if measurements[s][meas_idx].len() != z_dim {
+                        return (
+                            f64::NEG_INFINITY,
+                            MultisensorPosterior {
+                                existence: 0.0,
+                                mean: prior_mean,
+                                covariance: prior_cov,
+                            },
+                        );
+                    }
 
                     // Copy measurement
                     z.rows_mut(start, z_dim)
@@ -334,7 +331,7 @@ impl<A: MultisensorAssociator> MultisensorLmbmFilter<A> {
                     // Collect noise covariance
                     q_blocks.push(sensor.measurement_noise.clone());
 
-                    counter += 1;
+                    counter += z_dim;
                 }
             }
 
@@ -342,6 +339,7 @@ impl<A: MultisensorAssociator> MultisensorLmbmFilter<A> {
             let mut q = DMatrix::zeros(z_dim_total, z_dim_total);
             let mut offset = 0;
             for q_block in &q_blocks {
+                let z_dim = q_block.nrows();
                 q.view_mut((offset, offset), (z_dim, z_dim))
                     .copy_from(q_block);
                 offset += z_dim;
@@ -373,10 +371,21 @@ impl<A: MultisensorAssociator> MultisensorLmbmFilter<A> {
 
             // Detection probability product (log)
             let mut log_pd = 0.0;
-            for (sensor, &is_detecting) in self.sensors.sensors.iter().zip(detecting.iter()) {
+            for (sensor_idx, (sensor, &is_detecting)) in self
+                .sensors
+                .sensors
+                .iter()
+                .zip(detecting.iter())
+                .enumerate()
+            {
                 let p_d = sensor.detection_probability;
                 log_pd += if is_detecting {
                     p_d.ln()
+                } else if measurements[sensor_idx].is_empty() {
+                    // Sparse asynchronous sensors should not be treated as
+                    // active scans that missed when no measurement packet was
+                    // present for this frame.
+                    0.0
                 } else {
                     (1.0 - p_d).ln()
                 };
@@ -409,8 +418,10 @@ impl<A: MultisensorAssociator> MultisensorLmbmFilter<A> {
         } else {
             // All missed detections
             let mut prob_no_detect = 1.0;
-            for sensor in &self.sensors.sensors {
-                prob_no_detect *= 1.0 - sensor.detection_probability;
+            for (sensor_idx, sensor) in self.sensors.sensors.iter().enumerate() {
+                if !measurements[sensor_idx].is_empty() {
+                    prob_no_detect *= 1.0 - sensor.detection_probability;
+                }
             }
 
             let r = track.existence;
@@ -627,7 +638,9 @@ impl<A: MultisensorAssociator> MultisensorLmbmFilter<A> {
                 &dimensions,
             );
         } else if !has_measurements {
-            self.update_existence_no_measurements();
+            // No sensor produced a measurement packet for this frame. In the
+            // asynchronous wrapper this means no active scan was available, so
+            // existence should carry through prediction without a miss penalty.
         }
 
         // Capture pre-normalization hypotheses (step4 in MATLAB)
@@ -737,8 +750,9 @@ impl<A: MultisensorAssociator> Filter for MultisensorLmbmFilter<A> {
                 &dimensions,
             );
         } else if !has_measurements {
-            // No measurements from any sensor
-            self.update_existence_no_measurements();
+            // No sensor produced a measurement packet for this frame. In the
+            // asynchronous wrapper this means no active scan was available, so
+            // existence should carry through prediction without a miss penalty.
         }
 
         // ══════════════════════════════════════════════════════════════════════
