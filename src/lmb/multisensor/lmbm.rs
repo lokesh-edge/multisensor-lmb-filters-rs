@@ -503,48 +503,73 @@ impl<A: MultisensorAssociator> MultisensorLmbmFilter<A> {
         let num_sensors = dimensions.len() - 1;
         let num_objects = dimensions[num_sensors];
 
-        let mut new_hypotheses = Vec::new();
+        // The previous implementation cloned every prior hypothesis for every
+        // association sample and truncated the Cartesian product afterward.
+        // Rank the scalar combinations first so we clone only the exact top-K
+        // posterior hypotheses that normalization could retain.
+        let sample_scores = samples
+            .iter()
+            .map(|sample| self.association_sample_score(sample, log_likelihoods, dimensions))
+            .collect::<Vec<_>>();
 
-        for prior_hyp in &self.hypotheses {
-            for sample in samples {
-                // Create new hypothesis from prior
-                let mut new_hyp = prior_hyp.clone();
+        let mut combinations = self
+            .hypotheses
+            .iter()
+            .enumerate()
+            .flat_map(|(prior_index, prior_hyp)| {
+                sample_scores
+                    .iter()
+                    .enumerate()
+                    .map(move |(sample_index, sample_score)| {
+                        (
+                            prior_hyp.log_weight + sample_score,
+                            prior_index,
+                            sample_index,
+                        )
+                    })
+            })
+            .collect::<Vec<_>>();
 
-                // Decode sample: sample is flattened [v_{1,1}, v_{1,2}, ..., v_{n,S}] column-major
-                // So sample[s * num_objects + i] = v[i, s]
-                let mut log_likelihood_sum = 0.0;
+        combinations.sort_by(|left, right| right.0.total_cmp(&left.0));
+        combinations.truncate(self.lmbm_config.max_hypotheses);
 
-                for i in 0..num_objects.min(new_hyp.tracks.len()) {
-                    // Build association vector for object i
-                    let mut u: Vec<usize> = Vec::with_capacity(num_sensors + 1);
-                    for s in 0..num_sensors {
-                        let v_is = sample[s * num_objects + i];
-                        u.push(v_is + 1); // Convert to 1-indexed
-                    }
-                    u.push(i + 1); // Object index (1-indexed)
+        let mut new_hypotheses = Vec::with_capacity(combinations.len());
 
-                    // Get linear index
-                    let ell = self.cartesian_to_linear(&u, dimensions);
+        for (_score, prior_index, sample_index) in combinations {
+            let prior_hyp = &self.hypotheses[prior_index];
+            let sample = &samples[sample_index];
+            // Create new hypothesis from prior
+            let mut new_hyp = prior_hyp.clone();
 
-                    // Accumulate log-likelihood
-                    log_likelihood_sum += log_likelihoods[ell];
-
-                    // Update track with posterior
-                    let posterior = &posteriors[ell];
-                    new_hyp.tracks[i].existence = posterior.existence;
-
-                    // Replace GM components with single posterior
-                    new_hyp.tracks[i].components.clear();
-                    new_hyp.tracks[i].components.push(GaussianComponent {
-                        weight: 1.0,
-                        mean: posterior.mean.clone(),
-                        covariance: posterior.covariance.clone(),
-                    });
+            // Decode sample: sample is flattened [v_{1,1}, v_{1,2}, ..., v_{n,S}] column-major
+            // So sample[s * num_objects + i] = v[i, s]
+            for i in 0..num_objects.min(new_hyp.tracks.len()) {
+                // Build association vector for object i
+                let mut u: Vec<usize> = Vec::with_capacity(num_sensors + 1);
+                for s in 0..num_sensors {
+                    let v_is = sample[s * num_objects + i];
+                    u.push(v_is + 1); // Convert to 1-indexed
                 }
+                u.push(i + 1); // Object index (1-indexed)
 
-                new_hyp.log_weight += log_likelihood_sum;
-                new_hypotheses.push(new_hyp);
+                // Get linear index
+                let ell = self.cartesian_to_linear(&u, dimensions);
+
+                // Update track with posterior
+                let posterior = &posteriors[ell];
+                new_hyp.tracks[i].existence = posterior.existence;
+
+                // Replace GM components with single posterior
+                new_hyp.tracks[i].components.clear();
+                new_hyp.tracks[i].components.push(GaussianComponent {
+                    weight: 1.0,
+                    mean: posterior.mean.clone(),
+                    covariance: posterior.covariance.clone(),
+                });
             }
+
+            new_hyp.log_weight += sample_scores[sample_index];
+            new_hypotheses.push(new_hyp);
         }
 
         self.hypotheses = new_hypotheses;
