@@ -28,9 +28,35 @@ use super::super::config::{
 use super::super::errors::FilterError;
 use super::super::output::{StateEstimate, Trajectory};
 use super::super::traits::Filter;
-use super::super::types::{GaussianComponent, LmbmHypothesis, StepDetailedOutput, Track};
+use super::super::types::{
+    GaussianComponent, LmbmHypothesis, StepDetailedOutput, Track, TrackLabel,
+};
 use super::lmb::MultisensorMeasurements;
-use super::traits::{MultisensorAssociator, MultisensorGibbsAssociator};
+use super::traits::{
+    MultisensorAssociationResult, MultisensorAssociator, MultisensorGibbsAssociator,
+};
+
+/// Per-measurement covariance matrices, grouped by sensor and measurement.
+///
+/// The shape must match [`MultisensorMeasurements`]. Each covariance must be
+/// square and match the measurement dimension for its sensor.
+pub type MultisensorMeasurementCovariances = Vec<Vec<DMatrix<f64>>>;
+
+/// Result of a covariance-aware multisensor LMBM step.
+#[derive(Debug, Clone)]
+pub struct MultisensorLmbmStepResult {
+    /// Filtered state estimate.
+    pub estimate: StateEstimate,
+    /// Labels in the object order used by the native association sample.
+    pub predicted_track_labels: Vec<TrackLabel>,
+    /// Highest-likelihood native joint association sample.
+    ///
+    /// The sample is column-major by sensor: `sample[s * n + i]` is zero for
+    /// a miss or a one-based measurement index for track `i` and sensor `s`.
+    pub best_association: Option<Vec<usize>>,
+    /// Number of sensors represented in `best_association`.
+    pub num_sensors: usize,
+}
 
 /// Multi-sensor LMBM filter.
 ///
@@ -156,6 +182,15 @@ impl<A: MultisensorAssociator> MultisensorLmbmFilter<A> {
         self.sensors.num_sensors()
     }
 
+    /// Replaces the locations used for births on the next prediction step.
+    ///
+    /// Existence probabilities remain unchanged. This supports applications
+    /// that derive birth hypotheses from the current sensor field of view
+    /// rather than freezing births to the first few frames of a replay.
+    pub fn replace_birth_locations(&mut self, locations: Vec<super::super::config::BirthLocation>) {
+        self.birth.locations = locations;
+    }
+
     /// Predict all hypotheses forward in time.
     fn predict_hypotheses(&mut self, timestep: usize) {
         super::super::common_ops::predict_all_hypotheses(
@@ -176,6 +211,7 @@ impl<A: MultisensorAssociator> MultisensorLmbmFilter<A> {
         &self,
         tracks: &[Track],
         measurements: &MultisensorMeasurements,
+        measurement_covariances: Option<&MultisensorMeasurementCovariances>,
     ) -> (Vec<f64>, Vec<MultisensorPosterior>, Vec<usize>) {
         let num_sensors = self.num_sensors();
         let num_objects = tracks.len();
@@ -220,8 +256,13 @@ impl<A: MultisensorAssociator> MultisensorLmbmFilter<A> {
             let associations: Vec<usize> = u[0..num_sensors].iter().map(|&x| x - 1).collect();
 
             // Compute log-likelihood and posterior
-            let (log_l, posterior) =
-                self.compute_log_likelihood(obj_idx, &associations, tracks, measurements);
+            let (log_l, posterior) = self.compute_log_likelihood(
+                obj_idx,
+                &associations,
+                tracks,
+                measurements,
+                measurement_covariances,
+            );
 
             log_likelihoods[ell] = log_l;
             posteriors[ell] = posterior;
@@ -266,6 +307,7 @@ impl<A: MultisensorAssociator> MultisensorLmbmFilter<A> {
         associations: &[usize], // 0 = miss, 1..m = measurement index (0-indexed measurement)
         tracks: &[Track],
         measurements: &MultisensorMeasurements,
+        measurement_covariances: Option<&MultisensorMeasurementCovariances>,
     ) -> (f64, MultisensorPosterior) {
         let track = &tracks[obj_idx];
         let (prior_mean, prior_cov) = match (track.primary_mean(), track.primary_covariance()) {
@@ -329,7 +371,11 @@ impl<A: MultisensorAssociator> MultisensorLmbmFilter<A> {
                         .copy_from(&sensor.observation_matrix);
 
                     // Collect noise covariance
-                    q_blocks.push(sensor.measurement_noise.clone());
+                    q_blocks.push(
+                        measurement_covariances
+                            .map(|covariances| covariances[s][meas_idx].clone())
+                            .unwrap_or_else(|| sensor.measurement_noise.clone()),
+                    );
 
                     counter += z_dim;
                 }
@@ -624,7 +670,7 @@ impl<A: MultisensorAssociator> MultisensorLmbmFilter<A> {
         // (births can generate new hypotheses). Matches MATLAB behavior (runMultisensorLmbmFilter.m:51).
         if has_measurements && !self.hypotheses.is_empty() {
             let (log_likelihoods, posteriors, dimensions) =
-                self.generate_association_matrices(&self.hypotheses[0].tracks, measurements);
+                self.generate_association_matrices(&self.hypotheses[0].tracks, measurements, None);
 
             let association_result = self
                 .associator
@@ -693,6 +739,176 @@ impl<A: MultisensorAssociator> MultisensorLmbmFilter<A> {
             objects_likely_to_exist,
         })
     }
+
+    /// Advances the filter using covariance supplied for every measurement.
+    ///
+    /// This is an additive API: callers that only have one covariance model
+    /// per sensor can continue to use [`Filter::step`].
+    pub fn step_with_covariances<R: rand::Rng>(
+        &mut self,
+        rng: &mut R,
+        measurements: &MultisensorMeasurements,
+        measurement_covariances: &MultisensorMeasurementCovariances,
+        timestep: usize,
+    ) -> Result<MultisensorLmbmStepResult, FilterError> {
+        self.step_internal(rng, measurements, Some(measurement_covariances), timestep)
+    }
+
+    fn step_internal<R: rand::Rng>(
+        &mut self,
+        rng: &mut R,
+        measurements: &MultisensorMeasurements,
+        measurement_covariances: Option<&MultisensorMeasurementCovariances>,
+        timestep: usize,
+    ) -> Result<MultisensorLmbmStepResult, FilterError> {
+        if measurements.len() != self.num_sensors() {
+            return Err(FilterError::InvalidInput(format!(
+                "Expected {} sensors, got {}",
+                self.num_sensors(),
+                measurements.len()
+            )));
+        }
+
+        if let Some(covariances) = measurement_covariances {
+            self.validate_measurement_covariances(measurements, covariances)?;
+        }
+
+        self.predict_hypotheses(timestep);
+        self.init_birth_trajectories(super::super::DEFAULT_MAX_TRAJECTORY_LENGTH);
+
+        let predicted_track_labels = self
+            .hypotheses
+            .first()
+            .map(|hypothesis| hypothesis.tracks.iter().map(|track| track.label).collect())
+            .unwrap_or_default();
+        let has_measurements = measurements.iter().any(|sensor| !sensor.is_empty());
+        let mut best_association = None;
+
+        if has_measurements && !self.hypotheses.is_empty() {
+            let (log_likelihoods, posteriors, dimensions) = self.generate_association_matrices(
+                &self.hypotheses[0].tracks,
+                measurements,
+                measurement_covariances,
+            );
+
+            let association_result = self
+                .associator
+                .associate(rng, &log_likelihoods, &dimensions, &self.association_config)
+                .map_err(FilterError::Association)?;
+
+            best_association =
+                self.best_association_sample(&association_result, &log_likelihoods, &dimensions);
+
+            self.generate_posterior_hypotheses(
+                &association_result.samples,
+                &log_likelihoods,
+                &posteriors,
+                &dimensions,
+            );
+        }
+
+        self.normalize_and_gate_hypotheses();
+        self.gate_tracks();
+        self.update_trajectories(timestep);
+
+        Ok(MultisensorLmbmStepResult {
+            estimate: self.extract_estimates(timestep),
+            predicted_track_labels,
+            best_association,
+            num_sensors: self.num_sensors(),
+        })
+    }
+
+    fn validate_measurement_covariances(
+        &self,
+        measurements: &MultisensorMeasurements,
+        covariances: &MultisensorMeasurementCovariances,
+    ) -> Result<(), FilterError> {
+        if covariances.len() != measurements.len() {
+            return Err(FilterError::InvalidInput(format!(
+                "Expected covariance groups for {} sensors, got {}",
+                measurements.len(),
+                covariances.len()
+            )));
+        }
+
+        for (sensor_index, (sensor_measurements, sensor_covariances)) in
+            measurements.iter().zip(covariances).enumerate()
+        {
+            if sensor_measurements.len() != sensor_covariances.len() {
+                return Err(FilterError::InvalidInput(format!(
+                    "Sensor {sensor_index} has {} measurements but {} covariances",
+                    sensor_measurements.len(),
+                    sensor_covariances.len()
+                )));
+            }
+
+            for (measurement_index, (measurement, covariance)) in sensor_measurements
+                .iter()
+                .zip(sensor_covariances)
+                .enumerate()
+            {
+                let dimension = measurement.len();
+                let valid_shape =
+                    covariance.nrows() == dimension && covariance.ncols() == dimension;
+                let finite = covariance.iter().all(|value| value.is_finite());
+                let symmetric = (0..dimension).all(|row| {
+                    (0..dimension).all(|col| {
+                        (covariance[(row, col)] - covariance[(col, row)]).abs() <= 1.0e-8
+                    })
+                });
+                let positive_definite = valid_shape && covariance.clone().cholesky().is_some();
+
+                if !valid_shape || !finite || !symmetric || !positive_definite {
+                    return Err(FilterError::InvalidInput(format!(
+                        "Invalid covariance for sensor {sensor_index} measurement {measurement_index}"
+                    )));
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    fn best_association_sample(
+        &self,
+        result: &MultisensorAssociationResult,
+        log_likelihoods: &[f64],
+        dimensions: &[usize],
+    ) -> Option<Vec<usize>> {
+        let num_sensors = dimensions.len().checked_sub(1)?;
+        let num_objects = *dimensions.get(num_sensors)?;
+
+        result
+            .samples
+            .iter()
+            .filter(|sample| sample.len() >= num_sensors * num_objects)
+            .max_by(|left, right| {
+                self.association_sample_score(left, log_likelihoods, dimensions)
+                    .total_cmp(&self.association_sample_score(right, log_likelihoods, dimensions))
+            })
+            .cloned()
+    }
+
+    fn association_sample_score(
+        &self,
+        sample: &[usize],
+        log_likelihoods: &[f64],
+        dimensions: &[usize],
+    ) -> f64 {
+        let num_sensors = dimensions.len() - 1;
+        let num_objects = dimensions[num_sensors];
+
+        (0..num_objects)
+            .map(|object_index| {
+                let mut coordinate = (0..num_sensors)
+                    .map(|sensor_index| sample[sensor_index * num_objects + object_index] + 1)
+                    .collect::<Vec<_>>();
+                coordinate.push(object_index + 1);
+                log_likelihoods[self.cartesian_to_linear(&coordinate, dimensions)]
+            })
+            .sum()
+    }
 }
 
 impl<A: MultisensorAssociator> Filter for MultisensorLmbmFilter<A> {
@@ -705,75 +921,8 @@ impl<A: MultisensorAssociator> Filter for MultisensorLmbmFilter<A> {
         measurements: &Self::Measurements,
         timestep: usize,
     ) -> Result<StateEstimate, FilterError> {
-        // Validate measurements
-        if measurements.len() != self.num_sensors() {
-            return Err(FilterError::InvalidInput(format!(
-                "Expected {} sensors, got {}",
-                self.num_sensors(),
-                measurements.len()
-            )));
-        }
-
-        // ══════════════════════════════════════════════════════════════════════
-        // STEP 1: Prediction - propagate tracks forward and add birth components
-        // ══════════════════════════════════════════════════════════════════════
-        self.predict_hypotheses(timestep);
-
-        // ══════════════════════════════════════════════════════════════════════
-        // STEP 2: Initialize trajectory recording for new birth tracks
-        // ══════════════════════════════════════════════════════════════════════
-        self.init_birth_trajectories(super::super::DEFAULT_MAX_TRAJECTORY_LENGTH);
-
-        // ══════════════════════════════════════════════════════════════════════
-        // STEP 3: Measurement update - data association and track updates
-        // ══════════════════════════════════════════════════════════════════════
-        let has_measurements = measurements.iter().any(|m| !m.is_empty());
-
-        // CRITICAL: Always run association when measurements are available, even with 0 tracks
-        // (births can generate new hypotheses). Matches MATLAB behavior (runMultisensorLmbmFilter.m:51).
-        if has_measurements && !self.hypotheses.is_empty() {
-            // Generate joint association matrices across all sensors
-            let (log_likelihoods, posteriors, dimensions) =
-                self.generate_association_matrices(&self.hypotheses[0].tracks, measurements);
-
-            // Run multi-sensor association using the stored associator
-            let association_result = self
-                .associator
-                .associate(rng, &log_likelihoods, &dimensions, &self.association_config)
-                .map_err(FilterError::Association)?;
-
-            // Generate posterior hypotheses from association samples
-            self.generate_posterior_hypotheses(
-                &association_result.samples,
-                &log_likelihoods,
-                &posteriors,
-                &dimensions,
-            );
-        } else if !has_measurements {
-            // No sensor produced a measurement packet for this frame. In the
-            // asynchronous wrapper this means no active scan was available, so
-            // existence should carry through prediction without a miss penalty.
-        }
-
-        // ══════════════════════════════════════════════════════════════════════
-        // STEP 4: Hypothesis management (LMBM only) - normalize and gate hypotheses
-        // ══════════════════════════════════════════════════════════════════════
-        self.normalize_and_gate_hypotheses();
-
-        // ══════════════════════════════════════════════════════════════════════
-        // STEP 5: Track gating - prune low-existence tracks, archive trajectories
-        // ══════════════════════════════════════════════════════════════════════
-        self.gate_tracks();
-
-        // ══════════════════════════════════════════════════════════════════════
-        // STEP 6: Update trajectories - append current state to track histories
-        // ══════════════════════════════════════════════════════════════════════
-        self.update_trajectories(timestep);
-
-        // ══════════════════════════════════════════════════════════════════════
-        // STEP 7: Extract estimates - return current state estimate
-        // ══════════════════════════════════════════════════════════════════════
-        Ok(self.extract_estimates(timestep))
+        self.step_internal(rng, measurements, None, timestep)
+            .map(|result| result.estimate)
     }
 
     fn state(&self) -> &Self::State {
@@ -813,6 +962,7 @@ impl<A: MultisensorAssociator> FilterBuilder for MultisensorLmbmFilter<A> {
 mod tests {
     use super::*;
     use crate::lmb::{BirthLocation, SensorModel};
+    use rand::SeedableRng;
 
     fn create_test_filter() -> MultisensorLmbmFilter {
         let motion = MotionModel::constant_velocity_2d(1.0, 0.1, 0.99);
@@ -884,6 +1034,70 @@ mod tests {
         }
 
         assert!(!filter.hypotheses.is_empty());
+    }
+
+    #[test]
+    fn test_measurement_specific_covariance_changes_posterior() {
+        let mut filter = create_test_filter();
+        filter.predict_hypotheses(0);
+        let tracks = filter.hypotheses[0].tracks.clone();
+        let measurements = vec![vec![DVector::from_vec(vec![25.0, 25.0])], vec![]];
+        let small = vec![vec![DMatrix::identity(2, 2)], vec![]];
+        let large = vec![vec![DMatrix::identity(2, 2) * 10_000.0], vec![]];
+
+        let (_, small_posterior) =
+            filter.compute_log_likelihood(0, &[1, 0], &tracks, &measurements, Some(&small));
+        let (_, large_posterior) =
+            filter.compute_log_likelihood(0, &[1, 0], &tracks, &measurements, Some(&large));
+
+        assert!(small_posterior.mean[0] > large_posterior.mean[0]);
+        assert!(small_posterior.covariance[(0, 0)] < large_posterior.covariance[(0, 0)]);
+    }
+
+    #[test]
+    fn test_covariance_aware_step_reports_native_association() {
+        let mut filter = create_test_filter();
+        filter.association_config = AssociationConfig::gibbs(25);
+        let mut rng = rand::rngs::StdRng::seed_from_u64(42);
+        let measurements = vec![
+            vec![DVector::from_vec(vec![0.0, 0.0])],
+            vec![DVector::from_vec(vec![0.2, 0.2])],
+        ];
+        let covariances = vec![
+            vec![DMatrix::identity(2, 2)],
+            vec![DMatrix::identity(2, 2) * 2.0],
+        ];
+
+        let _initial = filter
+            .step_with_covariances(&mut rng, &measurements, &covariances, 0)
+            .unwrap();
+        let result = filter
+            .step_with_covariances(&mut rng, &measurements, &covariances, 1)
+            .unwrap();
+
+        assert_eq!(result.num_sensors, 2);
+        assert!(!result.predicted_track_labels.is_empty());
+        assert_eq!(
+            result.best_association.unwrap().len(),
+            result.num_sensors * result.predicted_track_labels.len()
+        );
+    }
+
+    #[test]
+    fn test_birth_locations_can_be_replaced_between_steps() {
+        let mut filter = create_test_filter();
+        filter.replace_birth_locations(vec![BirthLocation::new(
+            9,
+            DVector::from_vec(vec![100.0, 0.0, 200.0, 0.0]),
+            DMatrix::identity(4, 4) * 50.0,
+        )]);
+
+        filter.predict_hypotheses(3);
+
+        assert!(filter.hypotheses[0]
+            .tracks
+            .iter()
+            .any(|track| track.label.birth_time == 3 && track.label.birth_location == 9));
     }
 
     #[test]
